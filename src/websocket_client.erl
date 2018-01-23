@@ -11,6 +11,7 @@
 -export([start_link/3]).
 -export([start_link/4]).
 -export([start_link/5]).
+-export([stop/1]).
 -export([cast/2]).
 -export([send/2]).
 
@@ -145,6 +146,9 @@ start_link(FsmName, URL, Handler, HandlerArgs, Opts) when is_list(Opts) ->
         {error, _} = Error ->
             Error
     end.
+
+stop(FsmName) ->
+    gen_fsm:stop(FsmName).
 
 fsm_start_link(undefined, Args, Options) ->
     gen_fsm:start_link(?MODULE, Args, Options);
