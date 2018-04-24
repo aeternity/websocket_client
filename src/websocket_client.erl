@@ -11,6 +11,7 @@
 -export([start_link/3]).
 -export([start_link/4]).
 -export([start_link/5]).
+-export([start/3]).
 -export([stop/1]).
 -export([cast/2]).
 -export([send/2]).
@@ -106,6 +107,25 @@
          reconnect_tref = undefined :: undefined | reference(),
          ka_attempts = 0 :: non_neg_integer()
         }).
+
+
+%% @doc Start the websocket client
+%%
+%% URL : Supported schema: (ws | wss)
+%% Handler: module()
+%% Args : arguments to pass to Handler:init/1
+-spec start(URL :: string(), Handler :: module(), HandlerArgs :: list()) ->
+    {ok, pid()} | {error, term()}.
+start(URL, Handler, HandlerArgs) ->
+    case http_uri:parse(URL, [{scheme_defaults, [{ws,80},{wss,443}]}]) of
+        {ok, {Protocol, _, Host, Port, Path, Query}} ->
+            InitArgs = [Protocol, Host, Port, Path ++ Query, Handler, HandlerArgs, []],
+            %FsmOpts = [{dbg, [trace]}],
+            gen_fsm:start(?MODULE, InitArgs, []);
+        {error, _} = Error ->
+            Error
+    end.
+
 
 %% @doc Start the websocket client
 %%
