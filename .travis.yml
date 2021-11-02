@@ -1,10 +1,8 @@
 language: erlang
 otp_release:
-  - R16B03
-  - 17.5
-  - 18.3
-  - 19.1
+  - 21.3.8
+  - 22.3.2
 
-install: wget https://github.com/erlang/rebar3/releases/download/3.4.2/rebar3 && chmod 755 rebar3
+install: wget https://github.com/erlang/rebar3/releases/download/3.13.1/rebar3 && chmod 755 rebar3
 
 script: ./rebar3 update && ./rebar3 ct && ./rebar3 dialyzer && ./rebar3 coveralls send

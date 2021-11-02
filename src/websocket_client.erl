@@ -3,7 +3,7 @@
 %% @doc Erlang websocket client (FSM implementation)
 -module(websocket_client).
 
--behaviour(gen_fsm).
+-behaviour(gen_statem).
 %-compile([export_all]).
 
 -include("websocket_req.hrl").
@@ -16,19 +16,15 @@
 -export([cast/2]).
 -export([send/2]).
 
+-export([callback_mode/0]).
 -export([init/1]).
 -export([terminate/3]).
--export([handle_event/3]).
--export([handle_sync_event/4]).
--export([handle_info/3]).
+-export([handle_event/4]).
 -export([code_change/4]).
 
 % States
--export([disconnected/2]).
 -export([disconnected/3]).
--export([connected/2]).
 -export([connected/3]).
--export([handshaking/2]).
 -export([handshaking/3]).
 
 -type state_name() :: atom().
@@ -104,7 +100,6 @@
          handler   :: {module(), HState :: term()},
          buffer = <<>> :: binary(),
          reconnect :: boolean(),
-         reconnect_tref = undefined :: undefined | reference(),
          ka_attempts = 0 :: non_neg_integer()
         }).
 
@@ -160,7 +155,7 @@ start_link(FsmName, URL, Handler, HandlerArgs, Opts) when is_list(Opts) ->
     case http_uri:parse(URL, [{scheme_defaults, [{ws,80},{wss,443}]}]) of
         {ok, {Protocol, _, Host, Port, Path, Query}} ->
             InitArgs = [Protocol, Host, Port, Path ++ Query, Handler, HandlerArgs, Opts],
-            %FsmOpts = [{dbg, [trace]}],
+            % FsmOpts = [{debug, [log, trace]}],
             FsmOpts = [],
             fsm_start_link(FsmName, InitArgs, FsmOpts);
         {error, _} = Error ->
@@ -171,20 +166,25 @@ stop(FsmName) ->
     gen_fsm:stop(FsmName).
 
 fsm_start_link(undefined, Args, Options) ->
-    gen_fsm:start_link(?MODULE, Args, Options);
+    gen_statem:start_link(?MODULE, Args, Options);
 fsm_start_link(FsmName, Args, Options) ->
-    gen_fsm:start_link(FsmName, ?MODULE, Args, Options).
+    gen_statem:start_link(FsmName, ?MODULE, Args, Options).
 
 send(Client, Frame) ->
-    gen_fsm:sync_send_event(Client, {send, Frame}).
+    gen_statem:call(Client, {send, Frame}).
 
 %% Send a frame asynchronously
 -spec cast(Client :: pid(), websocket_req:frame()) -> ok.
 cast(Client, Frame) ->
-    gen_fsm:send_event(Client, {cast, Frame}).
+    gen_statem:cast(Client, {cast_frame, Frame}).
+
+-spec callback_mode() -> state_functions.
+callback_mode() ->
+    state_functions.
 
 -spec init(list(any())) ->
-    {ok, state_name(), #context{}}.
+    {ok, state_name(), #context{}}
+    | {ok, state_name(), #context{}, [{next_event, internal, connect}]}.
     %% NB DO NOT try to use Timeout to do keepalive.
 init([Protocol, Host, Port, Path, Handler, HandlerArgs, Opts]) ->
     {Connect, Reconnect, HState} =
@@ -215,8 +215,8 @@ init([Protocol, Host, Port, Path, Handler, HandlerArgs, Opts]) ->
                   handler   = {Handler, HState},
                   reconnect = Reconnect
                  },
-    Connect andalso gen_fsm:send_event(self(), connect),
-    {ok, disconnected, Context0}.
+    {ok, disconnected, Context0,
+     [ {next_event, internal, connect} || Connect ]}.
 
 -spec transport(ws | wss, {verify | verify_fun, term()},
                 list(inet:option())) -> #transport{}.
@@ -274,7 +274,6 @@ connect(#context{
            target={_Protocol, Host, Port, _Path},
            ka_attempts=KAs
           }=Context) ->
-    Context2 = maybe_cancel_reconnect(Context),
     case (T#transport.mod):connect(Host, Port, T#transport.opts, 6000) of
         {ok, Socket} ->
             WSReq1 = websocket_req:socket(Socket, WSReq0),
@@ -282,17 +281,17 @@ connect(#context{
                 ok ->
                     case websocket_req:keepalive(WSReq1) of
                         infinity ->
-                            {next_state, handshaking, Context2#context{ wsreq=WSReq1}};
+                            {next_state, handshaking, Context#context{ wsreq=WSReq1}};
                         KeepAlive ->
                             NewTimer = erlang:send_after(KeepAlive, self(), keepalive),
                             WSReq2 = websocket_req:set([{keepalive_timer, NewTimer}], WSReq1),
-                            {next_state, handshaking, Context2#context{ wsreq=WSReq2, ka_attempts=(KAs+1)}}
+                            {next_state, handshaking, Context#context{ wsreq=WSReq2, ka_attempts=(KAs+1)}}
                     end;
                 Error ->
-                    disconnect(Error, Context2)
+                    disconnect(Error, Context)
             end;
         {error,_}=Error ->
-            disconnect(Error, Context2)
+            disconnect(Error, Context)
     end.
 
 disconnect(Reason, #context{
@@ -303,98 +302,46 @@ disconnect(Reason, #context{
         {ok, HState1} ->
             {next_state, disconnected, Context#context{buffer = <<>>, handler={Handler, HState1}}};
         {reconnect, HState1} ->
-            ok = gen_fsm:send_event(self(), connect),
-            {next_state, disconnected, Context#context{handler={Handler, HState1}}};
+            {next_state, disconnected, Context#context{handler={Handler, HState1}},
+             {next_event, cast, connect}};
         {reconnect, Interval, HState1} ->
-            Tref = gen_fsm:send_event_after(Interval, connect),
-            {next_state, disconnected, Context#context{handler={Handler, HState1}, reconnect_tref=Tref}};
+            {next_state, disconnected, Context#context{handler={Handler, HState1}},
+             {{timeout, connect}, Interval, connect}};
         {close, Reason1, HState1} ->
             ok = websocket_close(WSReq0, Handler, HState1, Reason1),
             {stop, Reason1, Context#context{handler={Handler, HState1}}}
     end.
 
-disconnected(connect, Context0) ->
+disconnected(info, Msg, Context) ->
+    handle_info(Msg, Context);
+disconnected(internal, connect, Context0) ->
     connect(Context0);
-disconnected(_Event, Context) ->
-    % ignore
-    {next_state, disconnected, Context}.
-
-disconnected(connect, _From, Context0) ->
-    %% TODO FIXME This really seems wrong and too easy
+disconnected({timeout, connect}, connect, Context0) ->
+    connect(Context0);
+disconnected(internal, _, _) ->
+    keep_state_and_data;
+disconnected({call, From}, connect, Context0) ->
     case connect(Context0) of
         {next_state, State, Context1} ->
-            {reply, ok, State, Context1};
+            {next_state, State, Context1, [{reply, From, ok}]} ;
         Other ->
             Other
     end;
-disconnected(_Event, _From, Context) ->
-    {reply, {error, unhandled_sync_event}, disconnected, Context}.
+disconnected({call, From}, _, _) ->
+    {keep_state_and_data, {reply, From, {error, unhandled_sync_event}}}.
 
-connected(connect, Context) ->
-    %% We didn't cancel the reconnect_tref timer before the event was
-    %% sent
-    {next_state, connected, Context};
-connected({cast, Frame}, #context{wsreq=WSReq}=Context) ->
-    case encode_and_send(Frame, WSReq) of
-        ok ->
-            {next_state, connected, Context};
-        {error, closed} ->
-            {next_state, disconnected, Context}
-    end.
-
-connected({send, Frame}, _From, #context{wsreq=WSReq}=Context) ->
-    {reply, encode_and_send(Frame, WSReq), connected, Context};
-connected(_Event, _From, Context) ->
-    {reply, {error, unhandled_sync_event}, connected, Context}.
-
-handshaking(_Event, Context) ->
-    {next_state, handshaking, Context}.
-handshaking(_Event, _From, Context) ->
-    {reply, {error, unhandled_sync_event}, handshaking, Context}.
-
--spec handle_event(Event :: term(), state_name(), #context{}) ->
-    {next_state, state_name(), #context{}}
-    | {stop, Reason :: term(), #context{}}.
-handle_event(_Event, State, Context) ->
-    {next_state, State, Context}. %% i.e. ignore, do nothing
-
--spec handle_sync_event(Event :: term(), {From :: pid(), any()}, state_name(), #context{}) ->
-    {next_state, state_name(), #context{}}
-    | {reply, Reply :: term(), state_name(), #context{}}
-    | {stop, Reason :: term(), #context{}}
-    | {stop, Reason :: term(), Reply :: term(), #context{}}.
-handle_sync_event(Event, {_From, Tag}, State, Context) ->
-    {reply, {noop, Event, Tag}, State, Context}.
-
--spec handle_info(Info :: term(), state_name(), #context{}) ->
-    {next_state, state_name(), #context{}}
-    | {stop, Reason :: term(), #context{}}.
-handle_info(keepalive, KAState, #context{ wsreq=WSReq, ka_attempts=KAAttempts }=Context)
-  when KAState =:= handshaking; KAState =:= connected ->
-    [KeepAlive, KATimer, KAMax] =
-        websocket_req:get([keepalive, keepalive_timer, keepalive_max_attempts], WSReq),
-    case KATimer of
-        undefined -> ok;
-        _ -> erlang:cancel_timer(KATimer)
-    end,
-    case KAAttempts of
-        KAMax->
-            disconnect({error, keepalive_timeout}, Context);
-        _ ->
-            ok = encode_and_send({ping, <<"foo">>}, WSReq),
-            NewTimer = erlang:send_after(KeepAlive, self(), keepalive),
-            WSReq1 = websocket_req:set([{keepalive_timer, NewTimer}], WSReq),
-            {next_state, KAState, Context#context{wsreq=WSReq1, ka_attempts=(KAAttempts+1)}}
-    end;
-%% TODO Move Socket into #transport{} from #websocket_req{} so that we can
-%% match on it here
-handle_info({TransClosed, _Socket}, _CurrState,
-            #context{
-               transport=#transport{ closed=TransClosed } %% NB: matched
-              }=Context) ->
+connected({timeout, connect}, connect, _Context) ->
+    keep_state_and_data;
+connected({timeout, keepalive}, keepalive, Context) ->
+    handle_keepalive(connected, Context);
+connected(info, keepalive, Context) ->
+    handle_keepalive(connected, Context);
+connected(info, {TransClosed, _Sock},
+          #context{
+             transport=#transport{ closed=TransClosed } %% NB: matched
+            }=Context) ->
     disconnect({remote, closed}, Context);
-handle_info({TransError, _Socket, Reason},
-            _AnyState,
+connected(info, {TransError, _Sock, Reason},
             #context{
                transport=#transport{ error=TransError},
                handler={Handler, HState0},
@@ -402,8 +349,45 @@ handle_info({TransError, _Socket, Reason},
               }=Context) ->
     ok = websocket_close(WSReq, Handler, HState0, {TransError, Reason}),
     {stop, {socket_error, Reason}, Context};
-handle_info({Trans, _Socket, Data},
-            handshaking,
+connected(info, {Trans, _Socket, Data},
+          #context{
+             transport=#transport{ name=Trans }
+            }=Context) ->
+    handle_websocket_frame(Data, Context);
+connected(info, Msg, Context) ->
+    handle_info(Msg, Context);
+connected(internal, connect, Context) ->
+    {next_state, connected, Context};
+connected(cast, {cast_frame, Frame}, #context{wsreq=WSReq}=Context) ->
+    case encode_and_send(Frame, WSReq) of
+        ok ->
+            {next_state, connected, Context};
+        {error, closed} ->
+            {next_state, disconnected, Context}
+    end;
+connected({call, From}, {send, Frame}, #context{wsreq=WSReq}) ->
+    {keep_state_and_data, {reply, From, encode_and_send(Frame, WSReq)}};
+connected({call, From}, _Event, _Context) ->
+    {keep_state_and_data, {reply, From, {error, unhandled_sync_event}}}.
+
+handshaking({timeout, keepalive}, keepalive, Context) ->
+    handle_keepalive(handshaking, Context);
+handshaking(info, keepalive, Context) ->
+    handle_keepalive(handshaking, Context);
+handshaking(info, {TransClosed, _Sock},
+          #context{
+             transport=#transport{ closed=TransClosed } %% NB: matched
+            }=Context) ->
+    disconnect({remote, closed}, Context);
+handshaking(info, {TransError, _Sock, Reason},
+            #context{
+               transport=#transport{ error=TransError},
+               handler={Handler, HState0},
+               wsreq=WSReq
+              }=Context) ->
+    ok = websocket_close(WSReq, Handler, HState0, {TransError, Reason}),
+    {stop, {socket_error, Reason}, Context};
+handshaking(info, {Trans, _Socket, Data},
             #context{
                transport=#transport{ name=Trans },
                wsreq=WSReq1,
@@ -432,13 +416,54 @@ handle_info({Trans, _Socket, Data},
                                                 handler={Handler, HState2},
                                                 buffer= <<>>})
     end;
-handle_info({Trans, _Socket, Data},
-            connected,
-            #context{
-               transport=#transport{ name=Trans }
-              }=Context) ->
-    handle_websocket_frame(Data, Context);
-handle_info(Msg, State,
+handshaking(info, Msg, Context) ->
+    handle_info(Msg, Context);
+handshaking({call, From}, _Event, _Context) ->
+    {keep_state_and_data, {reply, From, {error, unhandled_sync_event}}};
+handshaking(_EType, _Event, _Context) ->
+    keep_state_and_data.
+
+-spec handle_event(EventType::gen_statem:event_type(),
+                   Event::term(),
+                   State::atom(),
+                   #context{}) ->
+    keep_state_and_data.
+handle_event(_, _, _, _) ->
+    keep_state_and_data. %% i.e. ignore, do nothing
+
+-spec handle_keepalive(state_name(), #context{}) ->
+    {next_state, state_name(), #context{}}
+    | {stop, Reason :: term(), #context{}}.
+handle_keepalive(KAState, #context{ wsreq=WSReq, ka_attempts=KAAttempts }=Context)
+  when KAState =:= handshaking; KAState =:= connected ->
+    [KeepAlive, KATimer, KAMax] =
+        websocket_req:get([keepalive, keepalive_timer, keepalive_max_attempts], WSReq),
+    case KATimer of
+        undefined -> ok;
+        _ -> erlang:cancel_timer(KATimer)
+    end,
+    case KAAttempts of
+        KAMax->
+            disconnect({error, keepalive_timeout}, Context);
+        _ ->
+            % case encode_and_send({ping, <<"foo">>}, WSReq) of
+            %     ok ->
+            ok = encode_and_send(ping, WSReq),
+                    NewTimer = erlang:send_after(KeepAlive, self(), keepalive),
+                    WSReq1 = websocket_req:set([{keepalive_timer, NewTimer}], WSReq),
+                    {next_state, KAState, Context#context{wsreq=WSReq1, ka_attempts=(KAAttempts+1)}}%%;
+                % {error, _} = Reason ->
+                %     disconnect(Reason, Context)
+            % end
+                    
+    end.
+
+-spec handle_info(Info :: term(), #context{}) ->
+    {keep_state, #context{}}
+    | {stop, Reason::term(), #context{}}.
+%% TODO Move Socket into #transport{} from #websocket_req{} so that we can
+%% match on it here
+handle_info(Msg,
             #context{
                wsreq=WSReq,
                handler={Handler, HState0},
@@ -448,16 +473,16 @@ handle_info(Msg, State,
         HandlerResponse ->
             case handle_response(HandlerResponse, Handler, WSReq) of
                 {ok, WSReqN, HStateN} ->
-                    {next_state, State, Context#context{
-                                          handler={Handler, HStateN},
-                                          wsreq=WSReqN,
-                                          buffer=Buffer}};
+                    {keep_state, Context#context{
+                                   handler={Handler, HStateN},
+                                   wsreq=WSReqN,
+                                   buffer=Buffer}};
                 {close, Reason, WSReqN, Handler, HStateN} ->
                     {stop, Reason, Context#context{
                                      wsreq=WSReqN,
                                      handler={Handler, HStateN}}}
             end
-    catch Class:Reason ->
+    catch Class:Reason:StackTrace ->
         %% TODO Maybe a function_clause catch here to allow
         %% not having to have a catch-all clause in websocket_info CB?
         error_logger:error_msg(
@@ -467,7 +492,7 @@ handle_info(Msg, State,
           "** Handler state was ~p~n"
           "** Stacktrace: ~p~n~n",
           [Handler, websocket_info, 3, Class, Reason, Msg, HState0,
-           erlang:get_stacktrace()]),
+           StackTrace]),
         websocket_close(WSReq, Handler, HState0, Reason),
         {stop, Reason, Context}
     end.
@@ -513,7 +538,7 @@ handle_websocket_frame(Data, #context{}=Context0) ->
                                          wsreq=WSReqN2,
                                          handler={Handler, HStateN2}}}
                 end
-            catch Class:Reason ->
+            catch Class:Reason:StackTrace ->
               error_logger:error_msg(
                 "** Websocket client ~p terminating in ~p/~p~n"
                 "   for the reason ~p:~p~n"
@@ -521,7 +546,7 @@ handle_websocket_frame(Data, #context{}=Context0) ->
                 "** Handler state was ~p~n"
                 "** Stacktrace: ~p~n~n",
                 [Handler, websocket_handle, 3, Class, Reason, Message, HState0,
-                  erlang:get_stacktrace()]),
+                  StackTrace]),
               {stop, Reason, Context#context{ wsreq=WSReqN }}
             end;
         {recv, WSReqN, BufferN} ->
@@ -577,20 +602,13 @@ encode_and_send(Frame, WSReq) ->
 websocket_close(WSReq, Handler, HandlerState, Reason) ->
     try
         Handler:websocket_terminate(Reason, WSReq, HandlerState)
-    catch Class:Reason2 ->
+    catch Class:Reason2:StackTrace ->
       error_logger:error_msg(
         "** Websocket handler ~p terminating in ~p/~p~n"
         "   for the reason ~p:~p~n"
         "** Handler state was ~p~n"
         "** Stacktrace: ~p~n~n",
         [Handler, websocket_terminate, 3, Class, Reason2, HandlerState,
-          erlang:get_stacktrace()])
+          StackTrace])
     end.
 %% TODO {stop, Reason, Context}
-
-maybe_cancel_reconnect(Context=#context{reconnect_tref=undefined}) ->
-    Context;
-maybe_cancel_reconnect(Context=#context{reconnect_tref=Tref}) when is_reference(Tref) ->
-    gen_fsm:cancel_timer(Tref),
-    Context#context{reconnect_tref=undefined}.
-
