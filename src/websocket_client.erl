@@ -11,7 +11,6 @@
 -export([start_link/3]).
 -export([start_link/4]).
 -export([start_link/5]).
--export([start/3]).
 -export([stop/1]).
 -export([cast/2]).
 -export([send/2]).
@@ -103,25 +102,6 @@
          ka_attempts = 0 :: non_neg_integer()
         }).
 
-
-%% @doc Start the websocket client
-%%
-%% URL : Supported schema: (ws | wss)
-%% Handler: module()
-%% Args : arguments to pass to Handler:init/1
--spec start(URL :: string(), Handler :: module(), HandlerArgs :: list()) ->
-    {ok, pid()} | {error, term()}.
-start(URL, Handler, HandlerArgs) ->
-    case http_uri:parse(URL, [{scheme_defaults, [{ws,80},{wss,443}]}]) of
-        {ok, {Protocol, _, Host, Port, Path, Query}} ->
-            InitArgs = [Protocol, Host, Port, Path ++ Query, Handler, HandlerArgs, []],
-            %FsmOpts = [{dbg, [trace]}],
-            gen_fsm:start(?MODULE, InitArgs, []);
-        {error, _} = Error ->
-            Error
-    end.
-
-
 %% @doc Start the websocket client
 %%
 %% URL : Supported schema: (ws | wss)
@@ -152,9 +132,10 @@ start_link(URL, Handler, HandlerArgs, Opts) ->
 start_link(FsmName, URL, Handler, HandlerArgs, Opts) when is_binary(URL) ->
   start_link(FsmName, binary_to_list(URL), Handler, HandlerArgs, Opts);
 start_link(FsmName, URL, Handler, HandlerArgs, Opts) when is_list(Opts) ->
-    case http_uri:parse(URL, [{scheme_defaults, [{ws,80},{wss,443}]}]) of
-        {ok, {Protocol, _, Host, Port, Path, Query}} ->
-            InitArgs = [Protocol, Host, Port, Path ++ Query, Handler, HandlerArgs, Opts],
+    case uri_string:parse(URL) of
+        #{scheme := Scheme, host := Host, port := Port, path := Path, query := Query } ->
+            Protocol = protocol(Scheme),
+            InitArgs = [Protocol, Host, Port, Path ++ "?" ++ Query, Handler, HandlerArgs, Opts],
             % FsmOpts = [{debug, [log, trace]}],
             FsmOpts = [],
             fsm_start_link(FsmName, InitArgs, FsmOpts);
@@ -162,8 +143,11 @@ start_link(FsmName, URL, Handler, HandlerArgs, Opts) when is_list(Opts) ->
             Error
     end.
 
+protocol("wss") -> wss;
+protocol("ws") -> ws.
+
 stop(FsmName) ->
-    gen_fsm:stop(FsmName).
+    gen_statem:stop(FsmName).
 
 fsm_start_link(undefined, Args, Options) ->
     gen_statem:start_link(?MODULE, Args, Options);
@@ -312,6 +296,19 @@ disconnect(Reason, #context{
             {stop, Reason1, Context#context{handler={Handler, HState1}}}
     end.
 
+disconnected(info, {TransClosed, _Sock},
+          #context{
+             transport=#transport{ closed=TransClosed } %% NB: matched
+            }=Context) ->
+    disconnect({remote, closed}, Context);
+disconnected(info, {TransError, _Sock, Reason},
+            #context{
+               transport=#transport{ error=TransError},
+               handler={Handler, HState0},
+               wsreq=WSReq
+              }=Context) ->
+    ok = websocket_close(WSReq, Handler, HState0, {TransError, Reason}),
+    {stop, {socket_error, Reason}, Context};
 disconnected(info, Msg, Context) ->
     handle_info(Msg, Context);
 disconnected(internal, connect, Context0) ->
