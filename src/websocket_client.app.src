@@ -1,8 +1,8 @@
 {application,websocket_client,
              [{description,"Erlang websocket client"},
-              {vsn,"1.3.0"},
+              {vsn,"1.4.2"},
               {registered,[]},
-              {applications,[ssl,crypto,inets]},
+              {applications,[kernel,stdlib,ssl,crypto,inets]},
               {env,[]},
               {modules,[]},
               {licenses,["MIT"]}]}.

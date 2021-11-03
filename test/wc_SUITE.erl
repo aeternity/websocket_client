@@ -16,7 +16,8 @@
          test_bad_request/1,
          test_keepalive_opt/1,
          test_keepalive_timeout/1,
-         test_reconnect_after/1
+         test_reconnect_after/1,
+         test_reply_from_handle/1
         ]).
 
 all() ->
@@ -28,7 +29,8 @@ all() ->
      test_bad_request,
      test_keepalive_opt,
      test_keepalive_timeout,
-     test_reconnect_after
+     test_reconnect_after,
+     test_reply_from_handle
     ].
 
 init_per_suite(Config) ->
@@ -135,7 +137,7 @@ test_bad_request(_) ->
 test_keepalive_opt(_) ->
     {ok, Pid} = ws_client:start_link("ws://localhost:8080", 100),
     receive {ok, Pid} -> ok after 500 -> ct:fail(timeout) end,
-    {pong, <<"foo">>} = ws_client:recv(Pid, 500),
+    {pong, <<>>} = ws_client:recv(Pid, 500),
     ws_client:stop(Pid),
     ok.
 
@@ -155,6 +157,13 @@ test_reconnect_after(_) ->
     echo_server:start(),
     receive {ok, Pid} -> ok after 1500 -> ct:fail(timeout) end,
     reconnect_interval_client:stop(Pid),
+    ok.
+
+test_reply_from_handle(_) ->
+    {ok, Pid} = increment_client:start_link("ws://localhost:8080"),
+    receive {ok, Pid} -> ok after 500 -> ct:fail(timeout) end,
+    receive {done, Pid} -> ok after 1500 -> ct:fail(timeout) end,
+    increment_client:stop(Pid),
     ok.
 
 short_msg() ->

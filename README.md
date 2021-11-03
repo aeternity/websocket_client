@@ -86,7 +86,7 @@ contiguous text or binary websocket frames.
 
 ## TODO
 
-The client has been significantly reworked, now backed by `gen_fsm`. There may still be bugs.
+The client has been significantly reworked, now backed by `gen_statem`. There may still be bugs.
 Please report them.
 
 1. Stop using `verify_none` by default
