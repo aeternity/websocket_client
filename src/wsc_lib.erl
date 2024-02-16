@@ -4,7 +4,9 @@
 %% Purely functional aspects of websocket client comms.
 %%
 %% Herein live all the functions for pure data processing.
+-ifdef(TEST).
 -compile([export_all]).
+-endif.
 -include("websocket_req.hrl").
 
 -export([create_auth_header/3]).
